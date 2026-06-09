@@ -1,0 +1,7 @@
+# Windows host dev: use local IB Gateway (not the ib-gateway sidecar).
+services:
+  mmr:
+    environment:
+      IB_SERVER_ADDRESS: host.docker.internal
+      IB_SERVER_PORT: "7497"
+    depends_on: []

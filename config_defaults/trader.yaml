@@ -31,8 +31,8 @@ require_proposal_approval: false
 # IB_ACCOUNT env var overrides the auto-selected account.
 # IB_SERVER_PORT env var overrides the auto-selected port.
 ib_server_address: 127.0.0.1
-ib_paper_account: ''
-ib_live_account: ''
+ib_paper_account: 'DUM449329'
+ib_live_account:  'U449329'
 ib_paper_port: 7497
 ib_live_port: 7496
 trading_runtime_ib_client_id: 5
@@ -63,9 +63,9 @@ zmq_data_rpc_server_address: tcp://127.0.0.1
 zmq_data_rpc_server_port: 42003
 
 # Massive.com (formerly Polygon.io)
-massive_api_key: ''
+massive_api_key: 'nXUB5ENAAjGRBATqLWRQqBzMn24eBYBl'
 massive_feed: stocks
 massive_delayed: false
 
 # TwelveData (parallel history backend; set TWELVEDATA_API_KEY env var as alternative)
-twelvedata_api_key: ''
+twelvedata_api_key: '5a12d9a4402041cbabc096f4d170448e'
