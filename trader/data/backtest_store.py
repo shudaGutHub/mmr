@@ -257,6 +257,14 @@ class BacktestStore:
                 except Exception as ex:
                     msg = str(ex).lower()
                     if 'already exists' in msg or 'duplicate' in msg:
+                        # Newer DuckDB versions can leave the connection in
+                        # an aborted-transaction state after a failed ALTER;
+                        # roll back so subsequent statements don't raise
+                        # TransactionException.
+                        try:
+                            conn.execute('ROLLBACK')
+                        except Exception:
+                            pass
                         continue
                     raise
         self.db.execute_atomic(_init)

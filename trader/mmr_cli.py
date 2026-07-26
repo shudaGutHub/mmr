@@ -6033,7 +6033,10 @@ def _handle_backtest_sweep(args: argparse.Namespace):
     container = Container.instance()
     cfg = container.config()
     duckdb_path = cfg.get('duckdb_path', '')
-    storage = TickStorage(duckdb_path)
+    # OHLCV bars live in the history DB (separate file from the trading DB);
+    # fall back to the trading DB for configs that don't split them.
+    history_path = cfg.get('history_duckdb_path', '') or duckdb_path
+    storage = TickStorage(history_path)
     accessor = UniverseAccessor(
         duckdb_path, cfg.get('universe_library', 'Universes'),
     )

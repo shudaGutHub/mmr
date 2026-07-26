@@ -38,6 +38,13 @@ class BacktestConfig:
     # executes at bar t+1's open. ``same_close`` reproduces the (lookahead-
     # biased) legacy behavior and is only intended for regression tests.
     fill_policy: str = 'next_open'
+    # Short selling. Off by default (legacy behavior: a SELL while flat is
+    # dropped). When True, a SELL while flat opens a short position (sized
+    # like BUYs: 10% of cash unless the signal carries a quantity) and a
+    # BUY while short covers the whole position. No margin modelling —
+    # short proceeds are credited to cash and equity marks the negative
+    # position to market.
+    allow_short: bool = False
 
 
 @dataclass
@@ -367,6 +374,7 @@ class Backtester:
             if fill_basis <= 0:
                 return
 
+            held = positions.get(conid, 0)
             quantity = signal.quantity if signal.quantity > 0 else 0
             if quantity == 0:
                 if signal.action == Action.SELL:
@@ -374,10 +382,19 @@ class Backtester:
                     # NOT 10% of cash (which is nonsense for a sell and
                     # rounds to 0 shares once cash is drained by multiple
                     # accumulating BUYs, silently dropping the exit).
-                    held = positions.get(conid, 0)
-                    quantity = held if held > 0 else 0
+                    if held > 0:
+                        quantity = held
+                    elif self.config.allow_short and held == 0:
+                        # Open a short, sized like a BUY entry.
+                        quantity = math.floor((cash * 0.1) / fill_basis) if fill_basis > 0 else 0
+                    else:
+                        quantity = 0
                 else:
-                    quantity = math.floor((cash * 0.1) / fill_basis) if fill_basis > 0 else 0
+                    if held < 0:
+                        # BUY while short = cover the whole position.
+                        quantity = -held
+                    else:
+                        quantity = math.floor((cash * 0.1) / fill_basis) if fill_basis > 0 else 0
             if quantity <= 0:
                 return
 
@@ -385,19 +402,32 @@ class Backtester:
             commission = quantity * self.config.commission_per_share
 
             if signal.action == Action.BUY:
+                covering = held < 0
+                if covering:
+                    # Cap covers at the short size — no accidental flip to long.
+                    quantity = min(quantity, -held)
+                    commission = quantity * self.config.commission_per_share
                 cost = quantity * fill_price + commission
-                if cost > cash:
+                if not covering and cost > cash:
                     return
                 cash -= cost
                 positions[conid] = positions.get(conid, 0) + quantity
                 position_entry_prices[conid] = fill_price
+                if positions[conid] == 0:
+                    positions.pop(conid, None)
+                    position_entry_prices.pop(conid, None)
+                    exit_conditions.pop(conid, None)
                 # Record time-based exit conditions if the signal carries
                 # them. Latest-BUY-wins: if the strategy adds to a position
                 # with a different max_hold_bars, the new rule applies from
                 # this bar onward (intuitive: "my new thesis is for this
                 # bar's entry"). Clears any prior pending_exit flag since
                 # adding to a position supersedes the queued close.
-                if (getattr(signal, 'max_hold_bars', None) is not None
+                # Skipped when the BUY flattened a short — there is no
+                # position left to attach a timer to.
+                if positions.get(conid, 0) == 0:
+                    pass
+                elif (getattr(signal, 'max_hold_bars', None) is not None
                         or getattr(signal, 'close_by_time', None) is not None):
                     exit_conditions[conid] = {
                         'entry_bar_index': bar_index.get(conid, 0),
@@ -412,18 +442,36 @@ class Backtester:
                     exit_conditions.pop(conid, None)
             elif signal.action == Action.SELL:
                 held = positions.get(conid, 0)
-                if held <= 0:
+                if held > 0:
+                    # Close (part of) a long.
+                    sell_qty = min(quantity, held)
+                    commission = sell_qty * self.config.commission_per_share
+                    proceeds = sell_qty * fill_price - commission
+                    cash += proceeds
+                    positions[conid] = positions.get(conid, 0) - sell_qty
+                    quantity = sell_qty
+                    if positions[conid] == 0:
+                        positions.pop(conid, None)
+                        position_entry_prices.pop(conid, None)
+                        exit_conditions.pop(conid, None)
+                elif self.config.allow_short and held == 0:
+                    # Open a short: credit proceeds, go negative.
+                    proceeds = quantity * fill_price - commission
+                    cash += proceeds
+                    positions[conid] = -quantity
+                    position_entry_prices[conid] = fill_price
+                    if (getattr(signal, 'max_hold_bars', None) is not None
+                            or getattr(signal, 'close_by_time', None) is not None):
+                        exit_conditions[conid] = {
+                            'entry_bar_index': bar_index.get(conid, 0),
+                            'max_hold_bars': signal.max_hold_bars,
+                            'close_by_time': signal.close_by_time,
+                            'pending_exit': False,
+                        }
+                else:
+                    # SELL while flat (shorts disabled) or while already
+                    # short (no pyramiding) — drop it.
                     return
-                sell_qty = min(quantity, held)
-                commission = sell_qty * self.config.commission_per_share
-                proceeds = sell_qty * fill_price - commission
-                cash += proceeds
-                positions[conid] = positions.get(conid, 0) - sell_qty
-                quantity = sell_qty
-                if positions[conid] == 0:
-                    positions.pop(conid, None)
-                    position_entry_prices.pop(conid, None)
-                    exit_conditions.pop(conid, None)
 
             trades.append(BacktestTrade(
                 timestamp=bar_ts if isinstance(bar_ts, dt.datetime) else dt.datetime.now(),
@@ -470,7 +518,7 @@ class Backtester:
             # fill policy as strategy-emitted signals (next_open by
             # default) so fills are consistent.
             for conid in list(exit_conditions.keys()):
-                if positions.get(conid, 0) <= 0:
+                if positions.get(conid, 0) == 0:
                     exit_conditions.pop(conid, None)
                     continue
                 cond = exit_conditions[conid]
@@ -499,12 +547,14 @@ class Backtester:
                 if not triggered:
                     continue
 
+                qty_held = positions[conid]
                 synthetic = Signal(
                     source_name=f'__time_exit__[{reason}]',
-                    action=Action.SELL,
+                    # Longs flatten via SELL; shorts cover via BUY.
+                    action=Action.SELL if qty_held > 0 else Action.BUY,
                     probability=1.0,
                     risk=0.0,
-                    quantity=positions[conid],
+                    quantity=abs(qty_held),
                 )
                 cond['pending_exit'] = True  # suppress re-trigger
                 if self.config.fill_policy == 'same_close':
@@ -580,46 +630,51 @@ class Backtester:
         else:
             max_drawdown = 0.0
 
-        # Win rate + per-round-trip P&L tracking. Each SELL closes part or
-        # all of an open position; we compute its P&L from the weighted
-        # average entry price and feed those P&Ls into profit_factor and
-        # expectancy_bps below.
+        # Win rate + per-round-trip P&L tracking. A trade that reduces the
+        # tracked (signed) position closes part or all of a round trip; we
+        # compute its P&L from the weighted average entry price and feed
+        # those P&Ls into profit_factor and expectancy_bps below. Longs
+        # close via SELL; shorts (allow_short) close via BUY covers.
         avg_entry: Dict[int, float] = {}   # conid -> weighted avg entry price
-        avg_qty: Dict[int, float] = {}     # conid -> total held quantity
+        pos_qty: Dict[int, float] = {}     # conid -> signed held quantity
         winning_trades = 0
-        sell_trades = 0
-        round_trip_pnl: List[float] = []           # dollar P&L per SELL
-        round_trip_return_pct: List[float] = []    # P&L / notional per SELL
+        closing_trades = 0
+        round_trip_pnl: List[float] = []           # dollar P&L per closing trade
+        round_trip_return_pct: List[float] = []    # P&L / notional per closing trade
         for trade in trades:
-            if trade.action == Action.BUY:
-                prev_qty = avg_qty.get(trade.conid, 0.0)
-                prev_cost = avg_entry.get(trade.conid, 0.0) * prev_qty
-                new_qty = prev_qty + trade.quantity
-                if new_qty > 0:
-                    avg_entry[trade.conid] = (prev_cost + trade.price * trade.quantity) / new_qty
-                    avg_qty[trade.conid] = new_qty
-            elif trade.action == Action.SELL:
-                sell_trades += 1
+            signed = trade.quantity if trade.action == Action.BUY else -trade.quantity
+            prev = pos_qty.get(trade.conid, 0.0)
+            if prev == 0.0 or (prev > 0) == (signed > 0):
+                # Opening a position or adding in the same direction —
+                # update the weighted average entry price.
+                new_qty = prev + signed
+                prev_cost = avg_entry.get(trade.conid, 0.0) * abs(prev)
+                if new_qty != 0:
+                    avg_entry[trade.conid] = (prev_cost + trade.price * abs(signed)) / abs(new_qty)
+                pos_qty[trade.conid] = new_qty
+            else:
+                # Reducing / closing. Commission was already deducted from
+                # the equity curve at fill time; we subtract the closing-side
+                # commission here for a trade-level view.
+                closing_trades += 1
                 entry_price = avg_entry.get(trade.conid, 0.0)
-                # Round-trip P&L and return-on-notional for this SELL. Commission
-                # was already deducted from the equity curve at fill time; we
-                # subtract the sell-side commission here for a trade-level view.
-                pnl = (trade.price - entry_price) * trade.quantity - trade.commission
+                closed = min(abs(signed), abs(prev))
+                direction = 1.0 if prev > 0 else -1.0
+                pnl = (trade.price - entry_price) * closed * direction - trade.commission
                 round_trip_pnl.append(pnl)
                 if entry_price > 0:
-                    notional = entry_price * trade.quantity
+                    notional = entry_price * closed
                     round_trip_return_pct.append(pnl / notional if notional > 0 else 0.0)
-                if entry_price > 0 and trade.price > entry_price:
+                if entry_price > 0 and (trade.price - entry_price) * direction > 0:
                     winning_trades += 1
-                # Reduce tracked quantity
-                remaining = avg_qty.get(trade.conid, 0.0) - trade.quantity
-                if remaining <= 0:
+                remaining = prev + signed
+                if remaining == 0 or (remaining > 0) != (prev > 0):
                     avg_entry.pop(trade.conid, None)
-                    avg_qty.pop(trade.conid, None)
+                    pos_qty.pop(trade.conid, None)
                 else:
-                    avg_qty[trade.conid] = remaining
+                    pos_qty[trade.conid] = remaining
 
-        win_rate = winning_trades / sell_trades if sell_trades > 0 else 0.0
+        win_rate = winning_trades / closing_trades if closing_trades > 0 else 0.0
 
         # ----- Extended practitioner metrics -----
 

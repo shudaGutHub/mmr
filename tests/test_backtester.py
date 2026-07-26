@@ -66,6 +66,40 @@ class BuySellStrategy(Strategy):
         return None
 
 
+class SellCoverStrategy(Strategy):
+    """Shorts on bar 2, covers on a later bar (for allow_short tests)."""
+
+    def __init__(self, sell_at=2, cover_at=4, quantity=10):
+        super().__init__()
+        self._call_count = 0
+        self._sell_at = sell_at
+        self._cover_at = cover_at
+        self._quantity = quantity
+
+    def on_prices(self, prices):
+        self._call_count += 1
+        conid = self.conids[0] if self.conids else 0
+        if self._call_count == self._sell_at:
+            return Signal(
+                source_name=self.name or "sell_cover",
+                action=Action.SELL,
+                probability=0.9,
+                risk=0.1,
+                conid=conid,
+                quantity=self._quantity,
+            )
+        elif self._call_count == self._cover_at:
+            return Signal(
+                source_name=self.name or "sell_cover",
+                action=Action.BUY,
+                probability=0.9,
+                risk=0.1,
+                conid=conid,
+                quantity=0,  # 0 = cover the whole short
+            )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -271,3 +305,113 @@ class TestBacktester:
             zero_price = result_zero.trades[0].price
             sqrt_price = result_sqrt.trades[0].price
             assert zero_price != sqrt_price
+
+
+class TestShortSelling:
+    """allow_short=True: SELL while flat opens a short, BUY covers it."""
+
+    @staticmethod
+    def _write_declining_bars(duckdb_path, conid=4391):
+        """Bars that fall steadily — profitable for a short."""
+        store = DuckDBDataStore(duckdb_path)
+        dates = pd.date_range("2024-01-02 09:30", periods=10, freq="1min", tz="UTC")
+        close = np.linspace(100.0, 91.0, 10)
+        df = pd.DataFrame({
+            "open": close + 0.1,
+            "high": close + 0.5,
+            "low": close - 0.5,
+            "close": close,
+            "volume": [1000.0] * 10,
+        }, index=dates)
+        df.index.name = "date"
+        store.write(str(conid), df)
+        return df
+
+    def test_sell_while_flat_dropped_by_default(self, tmp_duckdb_path):
+        self._write_declining_bars(tmp_duckdb_path)
+        bt = _make_backtester(tmp_duckdb_path)  # allow_short defaults False
+        strategy = _install_strategy(SellCoverStrategy(), tmp_duckdb_path)
+        result = bt.run(strategy, [4391])
+        # Legacy behavior: the naked SELL is dropped; the later BUY opens
+        # a plain long instead of covering anything.
+        assert all(t.action == Action.BUY for t in result.trades)
+
+    def test_short_roundtrip_profit_on_decline(self, tmp_duckdb_path):
+        from trader.simulation.slippage import ZeroSlippage
+
+        self._write_declining_bars(tmp_duckdb_path)
+        bt = _make_backtester(
+            tmp_duckdb_path, allow_short=True,
+            slippage_model=ZeroSlippage(), commission_per_share=0.0,
+        )
+        strategy = _install_strategy(SellCoverStrategy(sell_at=2, cover_at=5), tmp_duckdb_path)
+        result = bt.run(strategy, [4391])
+
+        actions = [t.action for t in result.trades]
+        assert actions == [Action.SELL, Action.BUY]
+        sell, cover = result.trades
+        assert sell.quantity == cover.quantity == 10
+        # Prices decline, so the short entry fills above the cover.
+        assert sell.price > cover.price
+        expected_pnl = (sell.price - cover.price) * 10
+        assert result.equity_curve.iloc[-1] == pytest.approx(100_000.0 + expected_pnl)
+        assert result.total_return > 0
+        assert result.win_rate == pytest.approx(1.0)
+        assert result.profit_factor == float('inf')
+
+    def test_short_time_exit_covers_via_buy(self, tmp_duckdb_path):
+        """A short carrying max_hold_bars must be covered by a synthetic BUY."""
+        from trader.simulation.slippage import ZeroSlippage
+
+        class TimedShortStrategy(Strategy):
+            def __init__(self):
+                super().__init__()
+                self._calls = 0
+
+            def on_prices(self, prices):
+                self._calls += 1
+                if self._calls == 2:
+                    return Signal(
+                        source_name="timed_short", action=Action.SELL,
+                        probability=0.9, risk=0.1, quantity=10,
+                        max_hold_bars=3,
+                    )
+                return None
+
+        self._write_declining_bars(tmp_duckdb_path)
+        bt = _make_backtester(
+            tmp_duckdb_path, allow_short=True,
+            slippage_model=ZeroSlippage(), commission_per_share=0.0,
+        )
+        strategy = _install_strategy(TimedShortStrategy(), tmp_duckdb_path)
+        result = bt.run(strategy, [4391])
+
+        actions = [t.action for t in result.trades]
+        assert actions == [Action.SELL, Action.BUY], (
+            "short must be covered by the synthesized time-exit BUY"
+        )
+        # Flat at the end: equity is pure cash and stays constant afterwards.
+        assert result.trades[1].quantity == 10
+
+    def test_no_short_pyramiding(self, tmp_duckdb_path):
+        """A second naked SELL while already short must be dropped."""
+        class DoubleSellStrategy(Strategy):
+            def __init__(self):
+                super().__init__()
+                self._calls = 0
+
+            def on_prices(self, prices):
+                self._calls += 1
+                if self._calls in (2, 4):
+                    return Signal(
+                        source_name="double_sell", action=Action.SELL,
+                        probability=0.9, risk=0.1, quantity=10,
+                    )
+                return None
+
+        self._write_declining_bars(tmp_duckdb_path)
+        bt = _make_backtester(tmp_duckdb_path, allow_short=True)
+        strategy = _install_strategy(DoubleSellStrategy(), tmp_duckdb_path)
+        result = bt.run(strategy, [4391])
+        sells = [t for t in result.trades if t.action == Action.SELL]
+        assert len(sells) == 1
