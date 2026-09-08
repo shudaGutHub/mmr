@@ -5,11 +5,13 @@ Defines the high and low of the first N minutes of each US trading day
 breaks above the range-high with above-average volume; SELL when close
 breaks below the range-low. Trades are filtered to regular trading hours
 (09:30–16:00 ET); pre-market and after-hours bars don't participate.
+Entries carry close_by_time so the backtester/live book is flat by 15:45 ET.
 
 Uses the precompute hook so the per-day range and volume average are
 computed once over the full series.
 """
 
+from datetime import time as dtime
 from trader.trading.strategy import Signal, Strategy
 from trader.objects import Action
 from typing import Any, Dict, Optional
@@ -19,12 +21,14 @@ import pandas as pd
 
 
 class OpeningRangeBreakout(Strategy):
-    """30-minute opening-range breakout, volume-confirmed, RTH-only."""
+    """30-minute opening-range breakout, volume-confirmed, RTH-only, EOD flat."""
 
     RANGE_MINUTES = 30
     VOLUME_MULT = 1.5              # current bar volume must exceed this × 20-bar SMA
     RTH_OPEN_MIN = 9 * 60 + 30     # 09:30 ET (in minutes since ET midnight)
     RTH_CLOSE_MIN = 16 * 60        # 16:00 ET
+    EOD_HOUR = 15
+    EOD_MINUTE = 45
     MIN_BARS = 40
 
     def precompute(self, prices: pd.DataFrame) -> Dict[str, Any]:
@@ -117,15 +121,18 @@ class OpeningRangeBreakout(Strategy):
         vol_ok = volume > vol_avg * self.VOLUME_MULT
 
         # BUY: close crosses above ORB high with volume
+        eod = dtime(self.EOD_HOUR, self.EOD_MINUTE)
         if close > orb_h and prev_close <= orb_h and vol_ok:
             return Signal(
                 source_name=self.name, action=Action.BUY,
                 probability=0.60, risk=0.40,
+                close_by_time=eod,
             )
         # SELL: close crosses below ORB low
         if close < orb_l and prev_close >= orb_l and vol_ok:
             return Signal(
                 source_name=self.name, action=Action.SELL,
                 probability=0.60, risk=0.40,
+                close_by_time=eod,
             )
         return None

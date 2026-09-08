@@ -180,3 +180,16 @@ class TestSyntheticSellLabeling:
             if '__time_exit__' in (s.strategy_name or '')
         ]
         assert len(exit_signals) >= 1
+
+
+class TestEodFlatIntradayBooks:
+    def test_orb_and_vwap_reversion_flatten_at_1545(self):
+        """Factory mix is EOD-flat only. ORB/VWAP reversion must declare
+        15:45 ET so close_by_time attaches to entries."""
+        from strategies.opening_range_breakout import OpeningRangeBreakout
+        from strategies.vwap_reversion import VwapReversion
+
+        assert OpeningRangeBreakout.EOD_HOUR == 15
+        assert OpeningRangeBreakout.EOD_MINUTE == 45
+        assert VwapReversion.EOD_HOUR == 15
+        assert VwapReversion.EOD_MINUTE == 45

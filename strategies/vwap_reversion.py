@@ -13,6 +13,7 @@ full series. Correctness of the session-VWAP reset depends on grouping by
 the date portion of the index; we assert no-lookahead in tests.
 """
 
+from datetime import time as dtime
 from trader.trading.strategy import Signal, Strategy
 from trader.objects import Action
 from typing import Any, Dict, Optional
@@ -32,13 +33,15 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
 
 
 class VwapReversion(Strategy):
-    """Intraday VWAP mean reversion with RSI confirmation — resets VWAP daily."""
+    """Intraday VWAP mean reversion with RSI confirmation — resets VWAP daily. EOD flat."""
 
     ENTRY_STD = 1.5           # σ from session VWAP to trigger entry
     RSI_PERIOD = 14
     RSI_OVERSOLD = 35
     RSI_OVERBOUGHT = 65
     STD_WINDOW = 30           # rolling std of (close − VWAP)
+    EOD_HOUR = 15
+    EOD_MINUTE = 45
     MIN_BARS = 40
 
     def precompute(self, prices: pd.DataFrame) -> Dict[str, Any]:
@@ -91,12 +94,14 @@ class VwapReversion(Strategy):
             return None
 
         z = (close - vwap) / std
+        eod = dtime(self.EOD_HOUR, self.EOD_MINUTE)
 
         # BUY: meaningfully below VWAP and RSI oversold (classic dip-buy).
         if z < -self.ENTRY_STD and rsi < self.RSI_OVERSOLD:
             return Signal(
                 source_name=self.name, action=Action.BUY,
                 probability=0.65, risk=0.35,
+                close_by_time=eod,
             )
 
         # EXIT LONG / enter-short symmetric: fire SELL when price CROSSES
