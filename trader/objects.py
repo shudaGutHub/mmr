@@ -133,6 +133,23 @@ class BarSize(IntEnum):
             )
         return mapping[bar_size]
 
+    @staticmethod
+    def to_databento_schema(bar_size: 'BarSize') -> str:
+        # Native Databento OHLCV schemas only — no silent resample.
+        # https://databento.com/docs/schemas-and-data-formats/ohlcv
+        mapping = {
+            BarSize.Secs1: 'ohlcv-1s',
+            BarSize.Mins1: 'ohlcv-1m',
+            BarSize.Hours1: 'ohlcv-1h',
+            BarSize.Days1: 'ohlcv-1d',
+        }
+        if bar_size not in mapping:
+            raise ValueError(
+                f'unsupported BarSize for Databento OHLCV: {bar_size}. '
+                f'Supported: 1 secs, 1 min, 1 hour, 1 day.'
+            )
+        return mapping[bar_size]
+
 
 # https://interactivebrokers.github.io/tws-api/classIBApi_1_1EClient.html#a7a19258a3a2087c07c1c57b93f659b63
 class TickList(IntEnum):

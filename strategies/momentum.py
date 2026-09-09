@@ -3,6 +3,8 @@
 Buys when 10-day momentum crosses above a threshold.
 Sells when 10-day momentum crosses below a negative threshold.
 Uses volume confirmation to filter low-conviction signals.
+
+The EOD-flat 1-min book is MomentumIntraday.
 """
 
 from trader.trading.strategy import Signal, Strategy

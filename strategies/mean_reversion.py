@@ -3,6 +3,8 @@
 Buys when price drops below the lower Bollinger Band (oversold).
 Sells when price rises above the upper Bollinger Band (overbought).
 Uses a 20-period lookback with 2 standard deviations.
+
+The EOD-flat 1-min book is MeanReversionIntraday.
 """
 
 from trader.trading.strategy import Signal, Strategy

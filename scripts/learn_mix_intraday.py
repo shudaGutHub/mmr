@@ -33,8 +33,9 @@ CHECKPOINT = ROOT / "scripts" / "learn_mix_intraday_checkpoint.json"
 DAILY_CKPT = ROOT / "scripts" / "learn_mix_checkpoint.json"
 DAYS = 60
 BAR = "1 min"
-FRESH_ROWS = 12_000  # ~30 RTH sessions of 1-min
 MIN_BARS_RUN = 4_000
+FRESH_ROWS = MIN_BARS_RUN  # Databento BASIC 1-min is thinner than Massive SIP
+
 WORKERS = 6
 NOTE = "factory-learn-mix-intraday {symbol} 1min 60d EOD-flat defaults"
 
@@ -47,6 +48,9 @@ STRATS = [
     ("strategies/opening_drive_fade.py", "OpeningDriveFade"),
     ("strategies/rsi_atr_range.py", "RsiAtrRange"),
     ("strategies/late_day_momentum.py", "LateDayMomentum"),
+    ("strategies/mean_reversion_intraday.py", "MeanReversionIntraday"),
+    ("strategies/momentum_intraday.py", "MomentumIntraday"),
+    ("strategies/keltner_breakout_intraday.py", "KeltnerBreakoutIntraday"),
 ]
 
 
@@ -127,6 +131,10 @@ def download_intraday(symbols: list[str], conids: dict[str, int | None], prior: 
     from trader.container import Container
     from trader.data.data_access import TickStorage
     from trader.data.store import DateRange
+    from trader.listeners.databento_history import (
+        DatabentoHistoryWorker,
+        load_databento_api_key,
+    )
     from trader.listeners.massive_history import MassiveHistoryWorker
     from trader.objects import BarSize
 
@@ -145,11 +153,26 @@ def download_intraday(symbols: list[str], conids: dict[str, int | None], prior: 
     if td_key:
         from trader.listeners.twelvedata_history import TwelveDataHistoryWorker
         td_worker = TwelveDataHistoryWorker(twelvedata_api_key=td_key)
+    db_worker = None
+    db_key = load_databento_api_key(cfg.get("databento_api_key") or None)
+    if db_key:
+        try:
+            db_worker = DatabentoHistoryWorker(api_key=db_key)
+        except Exception as ex:
+            print(f"databento worker unavailable: {ex}", flush=True)
 
     end_date = dt.datetime.now()
     start_date = end_date - dt.timedelta(days=DAYS)
     out: dict[str, dict] = dict(prior or {})
     massive_ok = True
+
+    def _try_source(sym: str, prefer: str):
+        if prefer == "databento":
+            if db_worker is None:
+                raise RuntimeError("databento not configured")
+            df = db_worker.get_history(sym, bar_size, start_date, end_date)
+            return df, "databento"
+        return _fetch_history(sym, bar_size, start_date, end_date, massive, td_worker, prefer)
 
     for i, sym in enumerate(symbols, 1):
         prev = out.get(sym) or {}
@@ -186,48 +209,41 @@ def download_intraday(symbols: list[str], conids: dict[str, int | None], prior: 
             continue
 
         write_key = cid if cid else sym
-        prefer = "twelvedata" if (not massive_ok and td_worker) else "massive"
-        try:
-            df, src = _fetch_history(sym, bar_size, start_date, end_date, massive, td_worker, prefer)
-            wrote = 0
-            if df is not None and not df.empty:
-                tickdata.write_resolve_overlap(write_key, df)
-                wrote = len(df)
-            n_after, last2 = _read_bars(tickdata, write_key, start_date, end_date)
-            out[sym] = {
-                "status": "ok" if n_after else "empty",
-                "rows": n_after,
-                "last": last2,
-                "key": str(write_key),
-                "wrote": wrote,
-                "source": src,
-            }
-            print(f"  [{i}/{len(symbols)}] {sym}: {src} wrote {wrote} now {n_after} last={last2}", flush=True)
-            time.sleep(0.4 if src == "massive" else 0.2)
-        except Exception as ex:
-            msg = str(ex)
-            if "429" in msg:
-                massive_ok = False
-            if td_worker and prefer == "massive":
-                try:
-                    df, src = _fetch_history(sym, bar_size, start_date, end_date, massive, td_worker, "twelvedata")
-                    wrote = 0
-                    if df is not None and not df.empty:
-                        tickdata.write_resolve_overlap(write_key, df)
-                        wrote = len(df)
-                    n_after, last2 = _read_bars(tickdata, write_key, start_date, end_date)
-                    out[sym] = {
-                        "status": "ok" if n_after else "empty",
-                        "rows": n_after,
-                        "last": last2,
-                        "key": str(write_key),
-                        "wrote": wrote,
-                        "source": src,
-                    }
-                    print(f"  [{i}/{len(symbols)}] {sym}: fallback {src} wrote {wrote} now {n_after}", flush=True)
-                    continue
-                except Exception as ex2:
-                    ex = ex2
+        order = []
+        if db_worker and (not massive_ok or n_exist == 0):
+            order.append("databento")
+        if massive_ok:
+            order.append("massive")
+        if db_worker and "databento" not in order:
+            order.append("databento")
+        if td_worker:
+            order.append("twelvedata")
+        if not order:
+            order.append("massive")
+
+        last_ex: Exception | None = None
+        wrote = 0
+        src = order[0]
+        n_after, last2 = n_exist, last
+        for prefer in order:
+            try:
+                df, src = _try_source(sym, prefer)
+                if df is not None and not df.empty:
+                    if "symbol" in df.columns:
+                        df = df.drop(columns=["symbol"])
+                    tickdata.write_resolve_overlap(write_key, df)
+                    wrote = len(df)
+                n_after, last2 = _read_bars(tickdata, write_key, start_date, end_date)
+                if n_after or wrote:
+                    last_ex = None
+                    break
+            except Exception as ex:
+                last_ex = ex
+                if "429" in str(ex):
+                    massive_ok = False
+                print(f"  [{i}/{len(symbols)}] {sym}: {prefer} failed {ex}", flush=True)
+                continue
+        if last_ex and not n_after:
             n_exist, last = _read_bars(tickdata, write_key, start_date, end_date)
             out[sym] = {
                 "status": "error",
@@ -235,10 +251,21 @@ def download_intraday(symbols: list[str], conids: dict[str, int | None], prior: 
                 "last": last,
                 "key": str(write_key),
                 "wrote": 0,
-                "error": f"{type(ex).__name__}: {ex}",
+                "error": f"{type(last_ex).__name__}: {last_ex}",
             }
-            print(f"  [{i}/{len(symbols)}] {sym}: ERROR {ex}", flush=True)
+            print(f"  [{i}/{len(symbols)}] {sym}: ERROR {last_ex}", flush=True)
             time.sleep(1.5)
+            continue
+        out[sym] = {
+            "status": "ok" if n_after else "empty",
+            "rows": n_after,
+            "last": last2,
+            "key": str(write_key),
+            "wrote": wrote,
+            "source": src,
+        }
+        print(f"  [{i}/{len(symbols)}] {sym}: {src} wrote {wrote} now {n_after} last={last2}", flush=True)
+        time.sleep(0.2)
     return out
 
 

@@ -186,6 +186,9 @@ class TestEodFlatIntradayBooks:
     def test_orb_and_vwap_reversion_flatten_at_1545(self):
         """Factory mix is EOD-flat only. ORB/VWAP reversion must declare
         15:45 ET so close_by_time attaches to entries."""
+        from strategies.keltner_breakout_intraday import KeltnerBreakoutIntraday
+        from strategies.mean_reversion_intraday import MeanReversionIntraday
+        from strategies.momentum_intraday import MomentumIntraday
         from strategies.opening_range_breakout import OpeningRangeBreakout
         from strategies.vwap_reversion import VwapReversion
 
@@ -193,3 +196,6 @@ class TestEodFlatIntradayBooks:
         assert OpeningRangeBreakout.EOD_MINUTE == 45
         assert VwapReversion.EOD_HOUR == 15
         assert VwapReversion.EOD_MINUTE == 45
+        assert MeanReversionIntraday.EOD_HOUR == 15
+        assert MomentumIntraday.EOD_HOUR == 15
+        assert KeltnerBreakoutIntraday.EOD_HOUR == 15

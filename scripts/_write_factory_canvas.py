@@ -50,10 +50,12 @@ for a in slim["agents"]:
         learn = "done"
     elif rec.get("block_reason") and "daily data" in str(rec.get("block_reason")):
         learn = "blocked"
-    elif rec.get("conId"):
-        learn = "queued"
     elif rec.get("preflight") == "blocked" or not rec.get("conId"):
         learn = "blocked"
+    elif rec.get("learn_state") == "active" or (ok_runs and not rec.get("mix_complete")):
+        learn = "active"
+    elif rec.get("conId"):
+        learn = "queued"
     mix[sym] = {
         "conId": rec.get("conId"),
         "preflight": rec.get("preflight") or "blocked",
@@ -509,9 +511,10 @@ export default function SymbolAgentFactory() {
       <Callout tone="warning" title="LEARN MIX status — honest, not fabricated">
         Paper trader_service is up (DUM449329) with ib_upstream_connected. All 74 names resolved via IB SMART/USD.
         LEARN MIX is the EOD-flat *intraday* book (1-min × 60d): GapReversion, VwapReversion,
-        VwapReclaim, OpeningRangeBreakout, OpeningDriveFade, RsiAtrRange, LateDayMomentum.
-        ORB and VWAP reversion now carry close_by_time 15:45 ET. MeanReversion / Momentum / Keltner
-        are overnight-capable and are out of this mix. Zero buy/sell/approve. auto_approve stays false.
+        VwapReclaim, OpeningRangeBreakout, OpeningDriveFade, RsiAtrRange, LateDayMomentum,
+        MeanReversionIntraday, MomentumIntraday, KeltnerBreakoutIntraday.
+        Overnight MeanReversion / Momentum / KeltnerBreakout stay out of this mix.
+        Zero buy/sell/approve. auto_approve stays false.
       </Callout>
 
       <H2>Factory floor</H2>

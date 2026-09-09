@@ -9,6 +9,8 @@ Differs from Bollinger-band mean reversion: Bollinger uses standard
 deviation (statistical); Keltner uses ATR (price-range). ATR doesn't
 compress as aggressively in low-vol regimes, so Keltner breakouts tend
 to fire more often in chop — we add volume confirmation to filter.
+
+The EOD-flat 1-min book is KeltnerBreakoutIntraday.
 """
 
 from trader.trading.strategy import Signal, Strategy
